@@ -6,44 +6,15 @@
 
 (enable-console-print!)
 
-(defonce app-state (atom {:segments []
+(defonce app-state (atom {:points []
                           :bounds {:width 1000
                                    :height 500}}))
-(defn add-segment! [segment]
-  (swap! app-state update-in [:segments] conj segment))
+
+(defonce point-chan (chan))
 
 (defn random-point []
   [(rand-int (get-in @app-state [:bounds :width]))
-               (rand-int (get-in @app-state [:bounds :height]))])
-
-;;; need better ways of choosing these
-(defn random-angle
-  []
-  (* 2 Math/PI (rand)))
-
-(defn random-dist []
-  (+ (* 500 (rand)) 100))
-
-(defn in-bounds? [[x y]]
-  (and (< 0 x)
-       (< 0 y)
-       (< x (get-in @app-state [:bounds :width]))
-       (< y (get-in @app-state [:bounds :height]))))
-
-(defn within-bounds [[x y]]
-  [(max (min x (get-in @app-state [:bounds :width])) 0)
-   (max (min y (get-in @app-state [:bounds :height])) 0)])
-
-(defn random-segment
-  ([]
-   [(random-point) (random-point)])
-  ([prev]
-   [prev (let [[px py] prev
-               angle (random-angle)
-               dist (random-dist)]
-           (within-bounds
-            [(+ px (* (Math/cos angle) dist))
-             (+ py (* (Math/sin angle) dist))]))]))
+   (rand-int (get-in @app-state [:bounds :height]))])
 
 (defn ccw [[ax ay]
            [bx by]
@@ -59,26 +30,6 @@
   (and (not= (ccw a1 b1 b2) (ccw a2 b1 b2))
        (not= (ccw a1 a2 b1) (ccw a1 b1 b2))))
 
-(defn successor-segment [limit]
-  (let [segments (:segments @app-state)]
-    (loop [pos (dec (count segments))
-           iter 0]
-      (let [top (last (nth segments pos))
-            segment (random-segment top)]
-        (if (< iter limit)
-          (if (not-any? (fn [other]
-                          (segments-intersect? segment other))
-                        segments)
-            segment
-            (recur pos (inc iter)))
-          (recur (dec pos) 0))))))
-
-(defn position [[[x1, y1], [x2, y2]]]
-  {:x1 x1
-   :y1 y1
-   :x2 x2
-   :y2 y2})
-
 (defn norm [vec]
   (Math/sqrt
    (reduce #(+ %1 (Math/pow %2 2)) 0 vec)))
@@ -87,33 +38,132 @@
   (norm (map - first second)))
 
 (defn animation-time
-  [dist]
-  (/ dist 1000))
+  [pair]
+  (/ (dist pair) 100))
+
+(defn cross-2d
+  [[vx vy] [wx wy]]
+  (- (* vx wy)
+     (* vy wx)))
+
+(defn sub
+  [a b]
+  (map - a b))
+
+(defn dot
+  [a b]
+  (reduce + (map * a b)))
+
+(defn add
+  [a b]
+  (map + a b))
+
+(defn scale
+  [v s]
+  (map (partial * s) v))
+
+(defn segment-intersection
+  "Computes the intersection of two segments or nil if there is none or infinitely many."
+  [[p p2] [q q2]]
+  (let [r (sub p2 p)
+        s (sub q2 q)
+        t (/ (cross-2d (sub q p) s)
+             (cross-2d r s))
+        u (/ (cross-2d (sub p q) r)
+             (cross-2d s r))]
+    (cond
+      ;; parallel non-intersecting
+      (and (zero? (cross-2d r s))
+           (not (zero? (cross-2d (sub q p) r))))
+      nil
+      ;; co-linear
+      (and (zero? (cross-2d r s))
+           (zero? (cross-2d
+                   (sub q p) r)))
+      nil                               ; they may overlap, but are co-linear
+                                        ; which is allowed
+      ;; not co-linear
+      (and (not (zero? (cross-2d r s)))
+           (<= 0 t 1)
+           (<= 0 u 1))
+      (add p (scale r t))
+      ;; all other cases
+      :else nil)))
+
+(defn segments-intersection
+  "Given a line segment L, and a list of line segments compute the longest
+  segment starting at L1 and no longer than L that does not intersect with any
+  other segments."
+  [segment others]
+  (reduce (fn [segment other]
+            (println segment)
+            (if-let [intersection (segment-intersection segment other)]
+              [(first segment) intersection]
+              segment))
+          segment others))
+
+(defn generate-points-indefinitely
+  ([]
+   (let [point (random-point)]
+     (put! point-chan point)
+     (. js/window (setTimeout #(generate-points-indefinitely point) 0))))
+  ([prev-point]
+   (let [point (random-point)
+         time (* (animation-time [prev-point point]) 1000)]
+     (put! point-chan point)
+     (. js/window (setTimeout #(generate-points-indefinitely point) time)))))
+
+(defn position [[[x1, y1], [x2, y2]]]
+  {:x1 x1
+   :y1 y1
+   :x2 x2
+   :y2 y2})
 
 (defn segment [data owner]
   (reify
     om/IRender
     (render [this]
-      (let [dist (dist data)]
+      (let [{points :points,
+             time :time} data]
         (dom/line (clj->js (merge
                             {:style {:stroke "black",
                                      :strokeWidth "2px"
-                                     :strokeDasharray dist
-                                     :strokeDashoffset dist
-                                     :animation (apply str "dash " 1 "s linear forwards")}}
-                            (position data))) nil)))))
+                                     :strokeDasharray (dist points)
+                                     :strokeDashoffset (dist points)
+                                     :animation (apply str "dash " time "s linear forwards")}}
+                            (position points))) nil)))))
 
 (defn path [data owner]
   (reify
-    om/IRender
-    (render [this]
-      (dom/g nil
-             (om/build-all segment (:segments data))))))
+    om/IInitState
+    (init-state [_]
+      {:points []})
+    om/IWillMount
+    (will-mount [_]
+      (let [point-chan (:point-chan data)]
+        (go-loop []
+          (let [points (om/get-state owner :points)
+                others (partition 2 1 points)
+                prev-point (last points)
+                initial-point (<! point-chan)
+                segment [prev-point initial-point]
+                final-point (if (some (partial segments-intersect? segment) others)
+                              (last (segments-intersection segment (drop-last others)))
+                              initial-point)]
+            (when-not (= prev-point final-point)
+              (om/set-state! owner :points (conj points final-point)))
+            (recur)))))
+    om/IRenderState
+    (render-state [this state]
+      (let [pairs (partition 2 1 (:points state))]
+        (dom/g nil
+               (om/build-all segment (map (fn [pair] {:points pair,
+                                                      :time (animation-time pair)})
+                                          pairs)))))))
 
 (defn main []
-  (add-segment! (random-segment))
-  (. js/window (setInterval #(add-segment! (successor-segment 1000)) 1000))
-  (om/root path app-state
-           {:target (. js/document (getElementById "container"))}))
+  (om/root path {:point-chan point-chan}
+           {:target (. js/document (getElementById "container"))})
+  (generate-points-indefinitely))
 
 (main)
