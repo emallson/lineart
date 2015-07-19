@@ -21,7 +21,6 @@
   (comp
    (serve :dir "target")
    (watch)
-   (reload :on-jsload 'atlanis.lineart.core/main)
    (cljs :source-maps true
          :optimizations :none
          :unified-mode true)))
